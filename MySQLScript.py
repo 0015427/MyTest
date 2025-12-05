@@ -6,6 +6,8 @@ from tqdm import tqdm
 import random
 import string
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 
 class MySQLBatchProcessor:
@@ -58,13 +60,35 @@ class MySQLBatchProcessor:
             self.connection = None
 
     def batch_execute(self, sql: str, data_list: List[Tuple[Any]],
-                      batch_size: int = 1000, show_progress: bool = False) -> bool:
+                      batch_size: int = 1000, show_progress: bool = False,
+                      use_multithreading: bool = False, max_workers: int = 4) -> bool:
         """
         批量执行SQL语句
 
         Args:
             sql: SQL模板语句
             data_list: 数据列表，每个元素是一个元组
+            batch_size: 每批处理的数据量
+            show_progress: 是否显示进度条
+            use_multithreading: 是否使用多线程
+            max_workers: 最大线程数
+
+        Returns:
+            bool: 执行是否成功
+        """
+        if use_multithreading:
+            return self._batch_execute_multithreaded(sql, data_list, batch_size, show_progress, max_workers)
+        else:
+            return self._batch_execute_single_threaded(sql, data_list, batch_size, show_progress)
+
+    def _batch_execute_single_threaded(self, sql: str, data_list: List[Tuple[Any]],
+                                       batch_size: int, show_progress: bool) -> bool:
+        """
+        单线程批量执行SQL语句
+
+        Args:
+            sql: SQL模板语句
+            data_list: 数据列表
             batch_size: 每批处理的数据量
             show_progress: 是否显示进度条
 
@@ -104,9 +128,79 @@ class MySQLBatchProcessor:
 
         return is_success
 
+    def _batch_execute_multithreaded(self, sql: str, data_list: List[Tuple[Any]],
+                                     batch_size: int, show_progress: bool, max_workers: int) -> bool:
+        """
+        多线程批量执行SQL语句
+
+        Args:
+            sql: SQL模板语句
+            data_list: 数据列表
+            batch_size: 每批处理的数据量
+            show_progress: 是否显示进度条
+            max_workers: 最大线程数
+
+        Returns:
+            bool: 执行是否成功
+        """
+        # 将数据分割成多个批次
+        batches = [data_list[i:i + batch_size] for i in range(0, len(data_list), batch_size)]
+
+        progress_bar = tqdm(total=len(data_list), desc="多线程处理进度", disable=not show_progress,
+                            ncols=100, leave=False)
+
+        is_success = True
+        lock = threading.Lock()
+
+        def process_batch(batch_data):
+            """处理单个批次的数据"""
+            local_connection = None
+            local_cursor = None
+            try:
+                # 每个线程创建独立的数据库连接
+                local_connection = pymysql.connect(**self.config)
+                local_cursor = local_connection.cursor()
+                local_cursor.executemany(sql, batch_data)
+                local_connection.commit()
+
+                with lock:
+                    progress_bar.update(len(batch_data))
+
+                return True
+            except Exception as e:
+                logging.error(f"批次处理失败: {e}")
+                if local_connection:
+                    local_connection.rollback()
+                return False
+            finally:
+                if local_cursor:
+                    local_cursor.close()
+                if local_connection:
+                    local_connection.close()
+
+        try:
+            # 使用线程池执行任务
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # 提交所有任务
+                future_to_batch = {executor.submit(process_batch, batch): batch for batch in batches}
+
+                # 等待所有任务完成
+                for future in as_completed(future_to_batch):
+                    if not future.result():
+                        is_success = False
+
+        except Exception as e:
+            logging.error(f"多线程执行失败: {e}")
+            is_success = False
+        finally:
+            progress_bar.close()
+
+        return is_success
+
     def batch_insert(self, table_name: str, columns: List[str],
                      data_list: List[Tuple[Any]], batch_size: int = 1000,
-                     show_progress: bool = False) -> bool:
+                     show_progress: bool = False, use_multithreading: bool = False,
+                     max_workers: int = 4) -> bool:
         """
         批量插入数据
 
@@ -116,6 +210,8 @@ class MySQLBatchProcessor:
             data_list: 数据列表
             batch_size: 批量大小
             show_progress: 是否显示进度条
+            use_multithreading: 是否使用多线程
+            max_workers: 最大线程数
 
         Returns:
             bool: 插入是否成功
@@ -125,11 +221,13 @@ class MySQLBatchProcessor:
         placeholders = ', '.join(['%s'] * len(columns))
         sql = f"INSERT INTO `{table_name}` ({columns_str}) VALUES ({placeholders})"
 
-        return self.batch_execute(sql, data_list, batch_size, show_progress)
+        return self.batch_execute(sql, data_list, batch_size, show_progress,
+                                  use_multithreading, max_workers)
 
     def batch_update(self, table_name: str, set_columns: List[str],
                      where_column: str, data_list: List[Tuple[Any]],
-                     batch_size: int = 1000, show_progress: bool = False) -> bool:
+                     batch_size: int = 1000, show_progress: bool = False,
+                     use_multithreading: bool = False, max_workers: int = 4) -> bool:
         """
         批量更新数据
 
@@ -140,6 +238,8 @@ class MySQLBatchProcessor:
             data_list: 数据列表，最后一个元素是WHERE条件值
             batch_size: 批量大小
             show_progress: 是否显示进度条
+            use_multithreading: 是否使用多线程
+            max_workers: 最大线程数
 
         Returns:
             bool: 更新是否成功
@@ -148,7 +248,8 @@ class MySQLBatchProcessor:
         set_clause = ', '.join([f"`{col}` = %s" for col in set_columns])
         sql = f"UPDATE `{table_name}` SET {set_clause} WHERE `{where_column}` = %s"
 
-        return self.batch_execute(sql, data_list, batch_size, show_progress)
+        return self.batch_execute(sql, data_list, batch_size, show_progress,
+                                  use_multithreading, max_workers)
 
     def execute_query(self, sql: str, params: Optional[Tuple[Any]] = None) -> List[Tuple[Any]]:
         """
@@ -257,27 +358,30 @@ if __name__ == "__main__":
         # 创建测试表
         create_test_table(processor)
 
-        # 生成100万条测试数据
-        print("正在生成100万条测试数据...")
+        # 生成测试数据
+        generate_data_count = 1000000
+        print(f"正在生成{generate_data_count}条测试数据...")
         start_time = time.time()
-        test_data = generate_test_data(1000000)
+        test_data = generate_test_data(generate_data_count)
         generate_time = time.time() - start_time
         print(f"数据生成完成，耗时: {generate_time:.2f}秒")
 
         # 批量插入数据并显示进度条
-        print("开始插入100万条数据...")
+        print(f"开始插入{generate_data_count}条数据...")
         start_time = time.time()
         is_success = processor.batch_insert(
             table_name='test_users',
             columns=['username', 'age', 'email', 'city'],
             data_list=test_data,
             batch_size=5000,  # 调整批次大小
-            show_progress=True  # 显示进度条
+            show_progress=True,  # 显示进度条
+            use_multithreading=True,  # 启用多线程
+            max_workers=4  # 设置最大线程数
         )
         insert_time = time.time() - start_time
         print(f"批量插入结果: {'成功' if is_success else '失败'}")
         print(f"插入耗时: {insert_time:.2f}秒")
-        print(f"平均每秒插入: {1000000 / insert_time:.0f}条记录")
+        print(f"平均每秒插入: {generate_data_count / insert_time:.0f}条记录")
 
     except Exception as e:
         logging.error(f"测试过程中出现错误: {e}")

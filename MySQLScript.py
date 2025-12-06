@@ -5,7 +5,6 @@ import time
 from tqdm import tqdm
 import random
 import string
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
@@ -100,6 +99,7 @@ class MySQLBatchProcessor:
                 return False
 
         cursor = self.connection.cursor()
+        progress_bar = None
         is_success = True
 
         try:
@@ -121,9 +121,9 @@ class MySQLBatchProcessor:
             logging.error(f"批量执行失败: {e}")
             self.connection.rollback()
             is_success = False
+        finally:
             if 'progress_bar' in locals():
                 progress_bar.close()
-        finally:
             cursor.close()
 
         return is_success
@@ -279,6 +279,61 @@ class MySQLBatchProcessor:
 
         return result
 
+    def load_data_from_file(self, table_name: str, csv_file_path: str, use_local: bool = False) -> bool:
+        """
+        使用LOAD DATA INFILE快速导入数据
+
+        Args:
+            table_name: 目标表名
+            csv_file_path: CSV文件路径
+            use_local: 是否使用LOCAL INFILE（需要客户端文件权限）
+
+        Returns:
+            bool: 导入是否成功
+        """
+        if not self.connection:
+            if not self.connect():
+                return False
+
+        cursor = self.connection.cursor()
+        try:
+            # 优化设置
+            optimize_for_bulk_insert(self)
+
+            # 根据是否使用LOCAL调整SQL语句
+            if use_local:
+                load_sql = f"""
+                LOAD DATA LOCAL INFILE '{csv_file_path}'
+                INTO TABLE `{table_name}`
+                FIELDS TERMINATED BY ','
+                ENCLOSED BY '"'
+                LINES TERMINATED BY '\\n'
+                IGNORE 0 ROWS
+                """
+            else:
+                load_sql = f"""
+                LOAD DATA INFILE '{csv_file_path}'
+                INTO TABLE `{table_name}`
+                FIELDS TERMINATED BY ','
+                ENCLOSED BY '"'
+                LINES TERMINATED BY '\\n'
+                IGNORE 0 ROWS
+                """
+
+            cursor.execute(load_sql)
+            self.connection.commit()
+
+            logging.info(f"成功导入 {cursor.rowcount} 条记录")
+            return True
+
+        except Exception as e:
+            logging.error(f"数据导入失败: {e}")
+            self.connection.rollback()
+            return False
+        finally:
+            restore_after_bulk_insert(self)
+            cursor.close()
+
 
 def generate_test_data(count: int) -> List[Tuple[Any]]:
     """
@@ -334,6 +389,164 @@ def create_test_table(processor: MySQLBatchProcessor):
         cursor.close()
 
 
+def optimize_for_bulk_insert(processor: MySQLBatchProcessor):
+    """为批量插入优化数据库设置"""
+    try:
+        cursor = processor.connection.cursor()
+        cursor.execute("SET autocommit=0")
+        cursor.execute("SET unique_checks=0")
+        cursor.execute("SET foreign_key_checks=0")
+        cursor.close()
+        logging.info("数据库已为批量插入优化")
+    except Exception as e:
+        logging.error(f"数据库优化设置失败: {e}")
+
+def restore_after_bulk_insert(processor: MySQLBatchProcessor):
+    """恢复数据库默认设置"""
+    try:
+        cursor = processor.connection.cursor()
+        cursor.execute("SET autocommit=1")
+        cursor.execute("SET unique_checks=1")
+        cursor.execute("SET foreign_key_checks=1")
+        cursor.close()
+        logging.info("数据库设置已恢复")
+    except Exception as e:
+        logging.error(f"数据库设置恢复失败: {e}")
+
+
+# plan two use LOAD DATA INFILE
+import  csv
+import os
+
+def save_data_to_secure_directory(data_list: List[Tuple[Any]], csv_file_path: str ,processor: MySQLBatchProcessor) -> str:
+    """将数据保存到MySQL允许的安全目录"""
+    # 获取安全目录路径
+    secure_dir = get_secure_file_priv(processor)
+
+    if not secure_dir:
+        raise Exception("无法获取secure_file_priv设置")
+
+    if secure_dir == "":
+        # 如果为空字符串，表示没有限制，可以使用临时目录
+        filename = os.path.join(os.getcwd(), csv_file_path)
+    else:
+        # 使用安全目录
+        filename = os.path.join(secure_dir, csv_file_path)
+
+    # 保存数据到CSV文件
+    with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerows(data_list)
+
+    return filename
+
+
+def get_secure_file_priv(processor: MySQLBatchProcessor) -> str:
+    """获取MySQL的secure-file-priv设置"""
+    try:
+        result = processor.execute_query("SHOW VARIABLES LIKE 'secure_file_priv'")
+        if result:
+            secure_dir = result[0][1] if len(result[0]) > 1 else ""
+            print(f"MySQL secure-file-priv设置: '{secure_dir}'")
+            return secure_dir
+        else:
+            print("无法获取secure-file-priv设置")
+            return ""
+    except Exception as e:
+        logging.error(f"检查secure-file-priv设置失败: {e}")
+        return ""
+
+
+def plan_two(processor: MySQLBatchProcessor):
+    '''
+    使用LOAD DATA INFILE导入数据  #难搞，要权限
+    :param processor:
+    :return:
+    '''
+
+    try:
+        # 连接数据库
+        if not processor.connect():
+            print("数据库连接失败")
+            exit(1)
+
+        # 创建测试表
+        create_test_table(processor)
+
+        # 生成测试数据并保存为CSV
+        generate_data_count = 10000000
+        print(f"正在生成{generate_data_count / 10000}万条测试数据...")
+        start_time = time.time()
+        test_data = generate_test_data(generate_data_count)
+        generate_time = time.time() - start_time
+        print(f"数据生成完成，耗时: {generate_time:.2f}秒")
+
+        csv_filename = "test_data.csv"
+        save_data_to_secure_directory(test_data, csv_filename, processor)
+
+        # 快速导入数据
+        start_time = time.time()
+        success = processor.load_data_from_file('test_users', csv_filename, True)
+        load_time = time.time() - start_time
+        print(f"LOAD DATA INFILE 结果: {'成功' if success else '失败'}")
+        print(f"导入耗时: {load_time:.2f}秒")
+        print(f"平均每秒插入: {generate_data_count / load_time:.0f}条记录")
+
+    except Exception as e:
+        logging.error(f"数据导入失败: {e}")
+    finally:
+        # 关闭连接
+        processor.disconnect()
+
+
+def plan_one(processor: MySQLBatchProcessor):
+    '''
+    使用批量插入插入数据
+    :param processor:
+    :return:
+    '''
+    # plan one
+    try:
+        # 连接数据库
+        if not processor.connect():
+            print("数据库连接失败")
+            exit(1)
+
+        # 创建测试表
+        create_test_table(processor)
+
+        # 生成测试数据
+        generate_data_count = 10000000
+        print(f"正在生成{generate_data_count / 10000}万条测试数据...")
+        start_time = time.time()
+        test_data = generate_test_data(generate_data_count)
+        generate_time = time.time() - start_time
+        print(f"数据生成完成，耗时: {generate_time:.2f}秒")
+
+        # 批量插入数据并显示进度条
+        print(f"开始插入{generate_data_count / 10000}万条数据...")
+        start_time = time.time()
+        is_success = processor.batch_insert(
+            table_name='test_users',
+            columns=['username', 'age', 'email', 'city'],
+            data_list=test_data,
+            batch_size=10000,  # 调整批次大小
+            show_progress=True,  # 显示进度条
+            use_multithreading=True,  # 启用多线程
+            max_workers=8  # 设置最大线程数
+        )
+        insert_time = time.time() - start_time
+        print(f"批量插入结果: {'成功' if is_success else '失败'}")
+        print(f"插入耗时: {insert_time:.2f}秒")
+        print(f"平均每秒插入: {generate_data_count / insert_time:.0f}条记录")
+
+    except Exception as e:
+        logging.error(f"测试过程中出现错误: {e}")
+    finally:
+        # 关闭连接
+        processor.disconnect()
+
+
 # 使用示例
 if __name__ == "__main__":
     # 配置日志
@@ -349,42 +562,4 @@ if __name__ == "__main__":
         database='performance_db'
     )
 
-    try:
-        # 连接数据库
-        if not processor.connect():
-            print("数据库连接失败")
-            exit(1)
-
-        # 创建测试表
-        create_test_table(processor)
-
-        # 生成测试数据
-        generate_data_count = 1000000
-        print(f"正在生成{generate_data_count}条测试数据...")
-        start_time = time.time()
-        test_data = generate_test_data(generate_data_count)
-        generate_time = time.time() - start_time
-        print(f"数据生成完成，耗时: {generate_time:.2f}秒")
-
-        # 批量插入数据并显示进度条
-        print(f"开始插入{generate_data_count}条数据...")
-        start_time = time.time()
-        is_success = processor.batch_insert(
-            table_name='test_users',
-            columns=['username', 'age', 'email', 'city'],
-            data_list=test_data,
-            batch_size=5000,  # 调整批次大小
-            show_progress=True,  # 显示进度条
-            use_multithreading=True,  # 启用多线程
-            max_workers=4  # 设置最大线程数
-        )
-        insert_time = time.time() - start_time
-        print(f"批量插入结果: {'成功' if is_success else '失败'}")
-        print(f"插入耗时: {insert_time:.2f}秒")
-        print(f"平均每秒插入: {generate_data_count / insert_time:.0f}条记录")
-
-    except Exception as e:
-        logging.error(f"测试过程中出现错误: {e}")
-    finally:
-        # 关闭连接
-        processor.disconnect()
+    plan_one(processor)

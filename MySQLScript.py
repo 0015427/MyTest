@@ -16,7 +16,7 @@ class MySQLBatchProcessor:
     """
 
     def __init__(self, host: str, port: int, user: str, password: str, database: str,
-                 charset: str = 'utf8mb4'):
+                 charset: str = 'utf8mb4', auto_optimize: bool = False):
         """
         初始化数据库连接参数
 
@@ -27,6 +27,7 @@ class MySQLBatchProcessor:
             password: 密码
             database: 数据库名
             charset: 字符集
+            auto_optimize: 是否自动应用批量操作优化设置
         """
         self.config = {
             'host': host,
@@ -36,6 +37,7 @@ class MySQLBatchProcessor:
             'database': database,
             'charset': charset
         }
+        self.auto_optimize = auto_optimize
         self.connection = None
 
     def connect(self) -> bool:
@@ -47,6 +49,8 @@ class MySQLBatchProcessor:
         """
         try:
             self.connection = pymysql.connect(**self.config)
+            if self.auto_optimize:
+                self._apply_bulk_optimizations()
             return True
         except Exception as e:
             logging.error(f"数据库连接失败: {e}")
@@ -55,6 +59,8 @@ class MySQLBatchProcessor:
     def disconnect(self):
         """关闭数据库连接"""
         if self.connection:
+            if self.auto_optimize:
+                self._restore_bulk_optimizations()
             self.connection.close()
             self.connection = None
 
@@ -298,7 +304,7 @@ class MySQLBatchProcessor:
         cursor = self.connection.cursor()
         try:
             # 优化设置
-            optimize_for_bulk_insert(self)
+            self._apply_bulk_optimizations()
 
             # 根据是否使用LOCAL调整SQL语句
             if use_local:
@@ -331,9 +337,39 @@ class MySQLBatchProcessor:
             self.connection.rollback()
             return False
         finally:
-            restore_after_bulk_insert(self)
+            self._restore_bulk_optimizations()
             cursor.close()
 
+    def _apply_bulk_optimizations(self):
+        """应用批量操作优化设置"""
+        if self.connection:
+            cursor = self.connection.cursor()
+            try:
+                # 会话级别变量，仅对当前会话有效
+                cursor.execute("SET autocommit=0")
+                cursor.execute("SET unique_checks=0")
+                cursor.execute("SET foreign_key_checks=0")
+                logging.info("数据库已为批量插入优化,关闭自动提交模式,关闭唯一性约束检查,关闭外键约束检查")
+            except Exception as e:
+                logging.error(f"批量操作优化设置失败: {e}")
+            finally:
+                cursor.close()
+
+
+    def _restore_bulk_optimizations(self):
+        """还原优化设置"""
+        if self.connection:
+            cursor = self.connection.cursor()
+            try:
+                # 会话级别变量，仅对当前会话有效
+                cursor.execute("SET autocommit=1")
+                cursor.execute("SET unique_checks=1")
+                cursor.execute("SET foreign_key_checks=1")
+                logging.info("数据库已还原为默认设置")
+            except Exception as e:
+                logging.error(f"还原优化设置失败: {e}")
+            finally:
+                cursor.close()
 
 def generate_test_data(count: int) -> List[Tuple[Any]]:
     """
@@ -387,31 +423,6 @@ def create_test_table(processor: MySQLBatchProcessor):
         logging.error(f"创建测试表失败: {e}")
     finally:
         cursor.close()
-
-
-def optimize_for_bulk_insert(processor: MySQLBatchProcessor):
-    """为批量插入优化数据库设置"""
-    try:
-        cursor = processor.connection.cursor()
-        cursor.execute("SET autocommit=0")
-        cursor.execute("SET unique_checks=0")
-        cursor.execute("SET foreign_key_checks=0")
-        cursor.close()
-        logging.info("数据库已为批量插入优化")
-    except Exception as e:
-        logging.error(f"数据库优化设置失败: {e}")
-
-def restore_after_bulk_insert(processor: MySQLBatchProcessor):
-    """恢复数据库默认设置"""
-    try:
-        cursor = processor.connection.cursor()
-        cursor.execute("SET autocommit=1")
-        cursor.execute("SET unique_checks=1")
-        cursor.execute("SET foreign_key_checks=1")
-        cursor.close()
-        logging.info("数据库设置已恢复")
-    except Exception as e:
-        logging.error(f"数据库设置恢复失败: {e}")
 
 
 # plan two use LOAD DATA INFILE
@@ -501,7 +512,7 @@ def plan_two(processor: MySQLBatchProcessor):
 
 def plan_one(processor: MySQLBatchProcessor):
     '''
-    使用批量插入插入数据
+    多线程使用批量插入插入数据
     :param processor:
     :return:
     '''
@@ -559,7 +570,8 @@ if __name__ == "__main__":
         port=3306,
         user='root',
         password='123456',
-        database='performance_db'
+        database='performance_db',
+        auto_optimize=True
     )
 
     plan_one(processor)

@@ -165,6 +165,10 @@ class MySQLBatchProcessor:
             try:
                 # 每个线程创建独立的数据库连接
                 local_connection = pymysql.connect(**self.config)
+                # 多线程也应用批量操作优化
+                if self.auto_optimize:
+                    self._apply_bulk_optimizations(local_connection)
+
                 local_cursor = local_connection.cursor()
                 local_cursor.executemany(sql, batch_data)
                 local_connection.commit()
@@ -182,6 +186,7 @@ class MySQLBatchProcessor:
                 if local_cursor:
                     local_cursor.close()
                 if local_connection:
+                    self._restore_bulk_optimizations(local_connection)
                     local_connection.close()
 
         try:
@@ -340,32 +345,36 @@ class MySQLBatchProcessor:
             self._restore_bulk_optimizations()
             cursor.close()
 
-    def _apply_bulk_optimizations(self):
+    def _apply_bulk_optimizations(self, connection= None):
         """应用批量操作优化设置"""
-        if self.connection:
-            cursor = self.connection.cursor()
+        conn = connection or self.connection
+        if conn:
+            cursor = conn.cursor()
             try:
                 # 会话级别变量，仅对当前会话有效
                 cursor.execute("SET autocommit=0")
                 cursor.execute("SET unique_checks=0")
                 cursor.execute("SET foreign_key_checks=0")
-                logging.info("数据库已为批量插入优化,关闭自动提交模式,关闭唯一性约束检查,关闭外键约束检查")
+                if not connection: # 仅在主连接上设置日志
+                    logging.info("数据库已为批量插入优化,关闭自动提交模式,关闭唯一性约束检查,关闭外键约束检查")
             except Exception as e:
                 logging.error(f"批量操作优化设置失败: {e}")
             finally:
                 cursor.close()
 
 
-    def _restore_bulk_optimizations(self):
+    def _restore_bulk_optimizations(self, connection= None):
         """还原优化设置"""
-        if self.connection:
-            cursor = self.connection.cursor()
+        conn = connection or self.connection
+        if conn:
+            cursor = conn.cursor()
             try:
                 # 会话级别变量，仅对当前会话有效
                 cursor.execute("SET autocommit=1")
                 cursor.execute("SET unique_checks=1")
                 cursor.execute("SET foreign_key_checks=1")
-                logging.info("数据库已还原为默认设置")
+                if not connection: # 仅在主连接上设置日志
+                    logging.info("数据库已还原为默认设置")
             except Exception as e:
                 logging.error(f"还原优化设置失败: {e}")
             finally:

@@ -599,7 +599,7 @@ def get_secure_file_priv(processor: MySQLBatchProcessor) -> str:
 
 def plan_two(processor: MySQLBatchProcessor):
     """
-    使用LOAD DATA INFILE导入数据  #难搞，要权限
+    使用LOAD DATA INFILE导入数据  #难搞，要权限 #或者拿生成的CSV去手动导入
     :param processor:
     :return:
     """
@@ -622,13 +622,11 @@ def plan_two(processor: MySQLBatchProcessor):
         print(f"数据生成完成，耗时: {generate_time:.2f}秒")
 
         csv_filename = "test_data.csv"
-        # 保存到本地，然后再手动导入
-        csv_filepath = save_data_to_csv(test_data, csv_filename)
-        # save_data_to_secure_directory(test_data, csv_filename, processor)
+        save_data_to_secure_directory(test_data, csv_filename, processor)
 
         # 快速导入数据
         start_time = time.time()
-        success = processor.load_data_from_file('test_users', csv_filepath, True)
+        success = processor.load_data_from_file('test_users', csv_filename, True)
         load_time = time.time() - start_time
         print(f"LOAD DATA INFILE 结果: {'成功' if success else '失败'}")
         print(f"导入耗时: {load_time:.2f}秒")
@@ -730,6 +728,51 @@ def plan_three(processor: MySQLBatchProcessor):
 
     except Exception as e:
         logging.error(f"生成SQL脚本失败: {e}")
+    finally:
+        # 断开连接
+        processor.disconnect()
+
+
+def plan_four(processor: MySQLBatchProcessor):
+    """
+    生成本地CSV文件以便手动导入
+    :param processor: MySQLBatchProcessor实例
+    """
+    try:
+        # 生成测试数据
+        generate_data_count = 10000000
+        print(f"正在生成{generate_data_count / 10000}万条测试数据...")
+        start_time = time.time()
+        test_data = generate_test_data(generate_data_count)
+        generate_time = time.time() - start_time
+        print(f"数据生成完成，耗时: {generate_time:.2f}秒")
+
+        # 生成CSV文件
+        csv_filename = "test_data_for_manual_import.csv"
+        print(f"正在生成CSV文件: {csv_filename}")
+
+        start_time = time.time()
+        csv_filepath = save_data_to_csv(test_data, csv_filename)
+        generate_csv_time = time.time() - start_time
+        file_size = os.path.getsize(csv_filename) / (1024 * 1024)  # MB
+
+        print(f"CSV文件生成完成，耗时: {generate_csv_time:.2f}秒")
+        print(f"CSV文件大小: {file_size:.2f} MB")
+        print(f"文件位置: {os.path.abspath(csv_filepath)}")
+        print("\n手动导入方法:")
+        print("1. 打开MySQL客户端工具(如Navicat、MySQL Workbench等)")
+        print("2. 右键点击目标表 'test_users'")
+        print("3. 选择 '导入向导' 或类似选项")
+        print("4. 选择生成的CSV文件")
+        print("5. 配置导入选项:")
+        print("   - 字段分隔符: 逗号(,)")
+        print("   - 文本限定符: 双引号(\")")
+        print("   - 行分隔符: 换行符(\\n)")
+        print("   - 第一行是否包含列名: 否")
+        print("6. 开始导入")
+
+    except Exception as e:
+        logging.error(f"生成CSV文件失败: {e}")
     finally:
         # 断开连接
         processor.disconnect()

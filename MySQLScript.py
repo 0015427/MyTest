@@ -438,13 +438,15 @@ def create_test_table(processor: MySQLBatchProcessor):
         cursor.close()
 
 
-def save_data_to_csv(data_list: List[Tuple[Any]], csv_file_path: str) -> str:
+def save_data_to_csv(data_list: List[Tuple[Any]], csv_file_path: str
+                     , column_names: Optional[List[str]] = None) -> str:
     """
     将数据保存为CSV文件，右键对应表，导入CSV文件
 
     Args:
         data_list: 数据列表
         csv_file_path: CSV文件路径
+        column_names: 列名列表(可选)
 
     Returns:
         str: CSV文件路径
@@ -456,6 +458,8 @@ def save_data_to_csv(data_list: List[Tuple[Any]], csv_file_path: str) -> str:
         # 保存数据到CSV文件
         with open(csv_file_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.writer(csvfile)
+            if column_names is not None:
+                writer.writerow(column_names)
             for i, row in enumerate(data_list):
                 writer.writerow(row)
                 # 每1000行更新一次进度条

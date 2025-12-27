@@ -7,8 +7,6 @@ import random
 import string
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-import re
-from datetime import datetime
 
 
 class MySQLBatchProcessor:
@@ -230,7 +228,7 @@ class MySQLBatchProcessor:
             bool: 插入是否成功
         """
         # 构造INSERT语句
-        columns_str = ', '.join([f'`{col}`' for col in columns])
+        columns_str = ', '.join(columns)
         placeholders = ', '.join(['%s'] * len(columns))
         sql = f"INSERT INTO `{table_name}` ({columns_str}) VALUES ({placeholders})"
 
@@ -382,296 +380,6 @@ class MySQLBatchProcessor:
             finally:
                 cursor.close()
 
-    def batch_insert_with_relationships(self, table_configs: List[dict],
-                                        batch_size: int = 1000,
-                                        show_progress: bool = False) -> bool:
-        """
-        批量插入具有关联关系的多表数据
-
-        Args:
-            table_configs: 包含表配置的列表，每个配置包含表名、列名、数据和关系信息
-            batch_size: 批量大小
-            show_progress: 是否显示进度条
-
-        Returns:
-            bool: 插入是否成功
-        """
-        if not self.connection:
-            if not self.connect():
-                return False
-
-        cursor = self.connection.cursor()
-
-        try:
-            # 按依赖顺序处理表（先插入被引用的表，后插入引用表）
-            ordered_configs = self._order_tables_by_dependency(table_configs)
-
-            for config in ordered_configs:
-                table_name = config['table_name']
-                columns = config['columns']
-                data_list = config['data']
-
-                # 如果表有依赖关系，需要处理外键
-                if 'foreign_key_mapping' in config:
-                    # 根据父表生成的ID更新当前表的外键
-                    data_list = self._update_foreign_keys(
-                        data_list, config['foreign_key_mapping']
-                    )
-
-                # 批量插入当前表数据
-                self.batch_insert(table_name, columns, data_list, batch_size, show_progress)
-
-                # 保存当前表的ID映射（如果需要被其他表引用）
-                if 'id_mapping_key' in config:
-                    self._save_id_mapping(config['id_mapping_key'], data_list)
-
-            self.connection.commit()
-            return True
-
-        except Exception as e:
-            logging.error(f"多表批量插入失败: {e}")
-            self.connection.rollback()
-            return False
-        finally:
-            cursor.close()
-
-    def _order_tables_by_dependency(self, table_configs: List[dict]) -> List[dict]:
-        """根据外键依赖关系对表进行排序"""
-        # 创建依赖图
-        dependencies = {}
-        table_config_map = {config['table_name']: config for config in table_configs}
-
-        for config in table_configs:
-            table_name = config['table_name']
-            dependencies[table_name] = []
-
-            if 'foreign_key_mapping' in config:
-                # 添加对父表的依赖
-                for fk_info in config['foreign_key_mapping']:
-                    parent_table = fk_info['parent_table']
-                    dependencies[table_name].append(parent_table)
-
-        # 拓扑排序
-        visited = set()
-        order = []
-
-        def dfs(table_name):
-            if table_name in visited:
-                return
-            visited.add(table_name)
-
-            for dep in dependencies.get(table_name, []):
-                dfs(dep)
-
-            order.append(table_config_map[table_name])
-
-        for table_name in dependencies:
-            dfs(table_name)
-
-        return order
-
-    def _update_foreign_keys(self, data_list: List[Tuple], foreign_key_mappings: List[dict]) -> List[Tuple]:
-        """更新数据中的外键值"""
-        updated_data = []
-
-        for row in data_list:
-            row_list = list(row)
-            for mapping in foreign_key_mappings:
-                # 根据映射规则更新外键值
-                fk_column_index = mapping['column_index']
-                parent_mapping_key = mapping['parent_mapping_key']
-
-                # 从已保存的ID映射中获取合适的父ID
-                parent_ids = self._get_saved_id_mapping(parent_mapping_key)
-                if parent_ids:
-                    # 随机选择一个父ID（可根据业务逻辑调整）
-                    selected_parent_id = random.choice(parent_ids)
-                    row_list[fk_column_index] = selected_parent_id
-
-            updated_data.append(tuple(row_list))
-
-        return updated_data
-
-    def _save_id_mapping(self, mapping_key: str, data_list: List[Tuple]):
-        """保存表的ID映射，供其他表引用"""
-        if not hasattr(self, '_id_mappings'):
-            self._id_mappings = {}
-
-        # 假设ID是第一列（可根据实际情况调整）
-        ids = [row[0] for row in data_list]
-        self._id_mappings[mapping_key] = ids
-
-    def _get_saved_id_mapping(self, mapping_key: str) -> List:
-        """获取已保存的ID映射"""
-        if hasattr(self, '_id_mappings') and mapping_key in self._id_mappings:
-            return self._id_mappings[mapping_key]
-        return []
-
-
-
-
-class MultiTableDataGenerator:
-    """多表关联数据生成器"""
-
-    def __init__(self, processor: MySQLBatchProcessor):
-        self.processor = processor
-        self.id_mappings = {}
-
-    def generate_related_data(self, schema_config: dict, record_counts: dict) -> dict:
-        """
-        生成具有关联关系的多表数据
-
-        Args:
-            schema_config: 数据库表结构配置
-            record_counts: 每个表需要生成的记录数量
-
-        Returns:
-            dict: 生成的数据，键为表名，值为数据列表
-        """
-        generated_data = {}
-
-        # 按依赖顺序生成数据
-        ordered_tables = self._get_ordered_tables(schema_config)
-
-        for table_name in ordered_tables:
-            if table_name in record_counts:
-                table_data = self._generate_table_data(
-                    table_name,
-                    schema_config[table_name],
-                    record_counts[table_name],
-                    generated_data
-                )
-                generated_data[table_name] = table_data
-
-        return generated_data
-
-    def _get_ordered_tables(self, schema_config: dict) -> List[str]:
-        """获取按依赖关系排序的表名列表"""
-        dependencies = {}
-
-        for table_name, table_info in schema_config.items():
-            dependencies[table_name] = []
-            if 'foreign_keys' in table_info:
-                for fk in table_info['foreign_keys']:
-                    dependencies[table_name].append(fk['references_table'])
-
-        # 拓扑排序
-        visited = set()
-        order = []
-
-        def dfs(table_name):
-            if table_name in visited:
-                return
-            visited.add(table_name)
-
-            for dep in dependencies.get(table_name, []):
-                dfs(dep)
-
-            order.append(table_name)
-
-        for table_name in dependencies:
-            dfs(table_name)
-
-        return order
-
-    def _generate_table_data(self, table_name: str, table_schema: dict,
-                             count: int, existing_data: dict) -> List[Tuple]:
-        """生成单个表的数据"""
-        data = []
-
-        for i in range(count):
-            row_data = []
-
-            for column in table_schema['columns']:
-                col_name = column['name']
-
-                # 跳过自增ID列
-                if 'id' in col_name.lower() or 'AUTO_INCREMENT' in column.get('extra', ''):
-                    continue
-
-                # 检查是否为外键
-                is_foreign_key = False
-                if 'foreign_keys' in table_schema:
-                    for fk in table_schema['foreign_keys']:
-                        if fk['column'] == col_name:
-                            # 从父表获取ID
-                            parent_table = fk['references_table']
-                            if parent_table in existing_data and existing_data[parent_table]:
-                                # 随机选择一个父表ID
-                                parent_ids = [row[0] for row in existing_data[parent_table]]  # 假设ID是第一列
-                                row_data.append(random.choice(parent_ids))
-                            else:
-                                row_data.append(None)  # 如果父表还没有数据，暂时设为NULL
-                            is_foreign_key = True
-                            break
-
-                if not is_foreign_key:
-                    # 生成普通列数据
-                    row_data.append(self._generate_column_value(column))
-
-            data.append(tuple(row_data))
-
-        return data
-
-    def _generate_column_value(self, column_schema: dict) -> Any:
-        """根据列类型生成值"""
-        col_type = column_schema['type'].upper()
-
-        if 'id' in column_schema['name'].lower() or col_type == 'INT' and 'AUTO_INCREMENT' in column_schema.get('extra', ''):
-            return None  # ID字段通常由数据库自动生成
-        elif col_type.startswith('VARCHAR') or col_type == 'TEXT':
-            length = int(re.search(r'\d+', col_type).group()) if re.search(r'\d+', col_type) else 50
-            return ''.join(random.choices(string.ascii_letters + string.digits, k=min(length, 8)))
-        elif col_type == 'INT':
-            return random.randint(1, 1000)
-        elif col_type in ['DATE', 'DATETIME', 'TIMESTAMP']:
-            return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        elif col_type == 'BOOLEAN':
-            return random.choice([True, False])
-        else:
-            return f"sample_{column_schema['name']}"
-
-    def insert_related_data(self, data_dict: dict, schema_config: dict, batch_size: int = 1000) -> bool:
-        """插入多表关联数据"""
-        try:
-            for table_name, data_list in data_dict.items():
-                if data_list:
-                    # 获取非ID列的列名
-                    columns = [col['name'] for col in schema_config[table_name]['columns']
-                               if col['name'] != 'id' and 'AUTO_INCREMENT' not in col.get('extra', '')]
-
-                    # 过滤掉每行数据中的ID值（通常是第一个元素）
-                    filtered_data_list = []
-                    for row in data_list:
-                        # 假设ID是第一个元素且为None，跳过它
-                        if row and len(row) > 0 and row[0] is None:
-                            filtered_data_list.append(row[1:])  # 跳过第一个元素
-                        else:
-                            filtered_data_list.append(row)
-
-                    success = self.processor.batch_insert(
-                        table_name=table_name,
-                        columns=columns,
-                        data_list=filtered_data_list,
-                        batch_size=batch_size,
-                        show_progress=True
-                    )
-
-                    if not success:
-                        logging.error(f"插入表 {table_name} 数据失败")
-                        return False
-
-            logging.info("所有表数据插入成功")
-            return True
-
-        except Exception as e:
-            logging.error(f"插入多表数据失败: {e}")
-            return False
-
-
-
-
-
 def generate_test_data(count: int) -> List[Tuple[Any]]:
     """
     生成测试数据
@@ -730,6 +438,210 @@ def create_test_table(processor: MySQLBatchProcessor):
         cursor.close()
 
 
+def save_data_to_csv(data_list: List[Tuple[Any]], csv_file_path: str
+                     , column_names: Optional[List[str]] = None) -> str:
+    """
+    将数据保存为CSV文件，右键对应表，导入CSV文件
+
+    Args:
+        data_list: 数据列表
+        csv_file_path: CSV文件路径
+        column_names: 列名列表(可选)
+
+    Returns:
+        str: CSV文件路径
+    """
+    try:
+        # 创建进度条
+        progress_bar = tqdm(total=len(data_list), desc="生成CSV文件", ncols=100)
+
+        # 保存数据到CSV文件
+        with open(csv_file_path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            if column_names is not None:
+                writer.writerow(column_names)
+            for i, row in enumerate(data_list):
+                writer.writerow(row)
+                # 每1000行更新一次进度条
+                if (i + 1) % 1000 == 0:
+                    progress_bar.update(1000)
+
+            # 更新剩余的进度
+            remaining = len(data_list) % 1000
+            if remaining > 0:
+                progress_bar.update(remaining)
+
+        progress_bar.close()
+        logging.info(f"CSV文件生成完成: {csv_file_path}")
+        return csv_file_path
+
+    except Exception as e:
+        logging.error(f"生成CSV文件失败: {e}")
+        raise
+
+
+def generate_sql_script(data_list: List[Tuple[Any]], sql_file_path: str,
+                        table_name: str, columns: List[str]) -> str:
+    """
+    生成SQL脚本文件，使用导入功能
+
+    Args:
+        data_list: 数据列表
+        sql_file_path: SQL文件路径
+        table_name: 表名
+        columns: 列名列表
+
+    Returns:
+        str: SQL文件路径
+    """
+    try:
+        # 创建进度条
+        progress_bar = tqdm(total=len(data_list), desc="生成SQL脚本", ncols=100)
+
+        # 写入SQL脚本文件
+        with open(sql_file_path, 'w', encoding='utf-8') as sql_file:
+            # 写入初始化设置
+            sql_file.write("-- SQL脚本用于批量插入数据\n")
+            sql_file.write("SET autocommit=0;\n")
+            sql_file.write("SET unique_checks=0;\n")
+            sql_file.write("SET foreign_key_checks=0;\n")
+            sql_file.write("START TRANSACTION;\n\n")
+
+            # 分批生成INSERT语句
+            batch_size = 10000
+            for i in range(0, len(data_list), batch_size):
+                batch_data = data_list[i:i + batch_size]
+
+                # 写入批次开始标记
+                sql_file.write(
+                    f"-- 批次 {i // batch_size + 1}: 记录 {i + 1} 到 {min(i + len(batch_data), len(data_list))}\n")
+
+                # 为这一批次生成INSERT语句
+                values_list = []
+                for row in batch_data:
+                    # 处理特殊字符和引号
+                    escaped_row = []
+                    for value in row:
+                        if isinstance(value, str):
+                            # 转义单引号
+                            escaped_value = value.replace("'", "''")
+                            escaped_row.append(f"'{escaped_value}'")
+                        elif value is None:
+                            escaped_row.append('NULL')
+                        else:
+                            escaped_row.append(str(value))
+                    values_list.append(f"({','.join(escaped_row)})")
+
+                # 写入完整的INSERT语句
+                columns_str = ', '.join([f"`{col}`" for col in columns])
+                insert_statement = f"INSERT INTO `{table_name}` ({columns_str}) VALUES \n"
+                insert_statement += ",\n".join(values_list) + ";\n"
+                sql_file.write(insert_statement)
+
+                # 每100批提交一次事务
+                if (i // batch_size + 1) % 100 == 0:
+                    sql_file.write("COMMIT;\n")
+                    sql_file.write("START TRANSACTION;\n")
+
+                # 更新进度条
+                progress_bar.update(len(batch_data))
+
+            # 写入最终提交
+            sql_file.write("COMMIT;\n")
+            sql_file.write("-- 数据生成完成\n")
+
+        progress_bar.close()
+        logging.info(f"SQL脚本生成完成: {sql_file_path}")
+        return sql_file_path
+
+    except Exception as e:
+        logging.error(f"生成SQL脚本失败: {e}")
+        raise
+
+# plan two use LOAD DATA INFILE
+import  csv
+import os
+
+def save_data_to_secure_directory(data_list: List[Tuple[Any]], csv_file_path: str ,processor: MySQLBatchProcessor) -> str:
+    """将数据保存到MySQL允许的安全目录"""
+    # 获取安全目录路径
+    secure_dir = get_secure_file_priv(processor)
+
+    if not secure_dir:
+        raise Exception("无法获取secure_file_priv设置")
+
+    if secure_dir == "":
+        # 如果为空字符串，表示没有限制，可以使用临时目录
+        filename = os.path.join(os.getcwd(), csv_file_path)
+    else:
+        # 使用安全目录
+        filename = os.path.join(secure_dir, csv_file_path)
+
+    # 保存数据到CSV文件
+    with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerows(data_list)
+
+    return filename
+
+
+def get_secure_file_priv(processor: MySQLBatchProcessor) -> str:
+    """获取MySQL的secure-file-priv设置"""
+    try:
+        result = processor.execute_query("SHOW VARIABLES LIKE 'secure_file_priv'")
+        if result:
+            secure_dir = result[0][1] if len(result[0]) > 1 else ""
+            print(f"MySQL secure-file-priv设置: '{secure_dir}'")
+            return secure_dir
+        else:
+            print("无法获取secure-file-priv设置")
+            return ""
+    except Exception as e:
+        logging.error(f"检查secure-file-priv设置失败: {e}")
+        return ""
+
+
+def plan_two(processor: MySQLBatchProcessor):
+    """
+    使用LOAD DATA INFILE导入数据  #难搞，要权限 #或者拿生成的CSV去手动导入
+    :param processor:
+    :return:
+    """
+
+    try:
+        # 连接数据库
+        if not processor.connect():
+            print("数据库连接失败")
+            exit(1)
+
+        # 创建测试表
+        create_test_table(processor)
+
+        # 生成测试数据并保存为CSV
+        generate_data_count = 10000000
+        print(f"正在生成{generate_data_count / 10000}万条测试数据...")
+        start_time = time.time()
+        test_data = generate_test_data(generate_data_count)
+        generate_time = time.time() - start_time
+        print(f"数据生成完成，耗时: {generate_time:.2f}秒")
+
+        csv_filename = "test_data.csv"
+        save_data_to_secure_directory(test_data, csv_filename, processor)
+
+        # 快速导入数据
+        start_time = time.time()
+        success = processor.load_data_from_file('test_users', csv_filename, True)
+        load_time = time.time() - start_time
+        print(f"LOAD DATA INFILE 结果: {'成功' if success else '失败'}")
+        print(f"导入耗时: {load_time:.2f}秒")
+        print(f"平均每秒插入: {generate_data_count / load_time:.0f}条记录")
+
+    except Exception as e:
+        logging.error(f"数据导入失败: {e}")
+    finally:
+        # 关闭连接
+        processor.disconnect()
+
 
 def plan_one(processor: MySQLBatchProcessor):
     """
@@ -777,3 +689,112 @@ def plan_one(processor: MySQLBatchProcessor):
     finally:
         # 关闭连接
         processor.disconnect()
+
+
+def plan_three(processor: MySQLBatchProcessor):
+    """
+    生成SQL脚本文件用于后续手动导入
+    :param processor: MySQLBatchProcessor实例
+    """
+    try:
+        # 生成测试数据
+        generate_data_count = 10000000
+        print(f"正在生成{generate_data_count / 10000}万条测试数据...")
+        start_time = time.time()
+        test_data = generate_test_data(generate_data_count)
+        generate_time = time.time() - start_time
+        print(f"数据生成完成，耗时: {generate_time:.2f}秒")
+
+        # 生成SQL脚本文件
+        sql_filename = "insert_test_data.sql"
+        print(f"正在生成SQL脚本文件: {sql_filename}")
+
+        start_time = time.time()
+
+        sql_filepath = generate_sql_script(
+            data_list=test_data,
+            sql_file_path=sql_filename,
+            table_name='test_users',
+            columns=['username', 'age', 'email', 'city']
+        )
+
+        generate_sql_time = time.time() - start_time
+        file_size = os.path.getsize(sql_filename) / (1024 * 1024)  # MB
+
+        print(f"SQL脚本生成完成，耗时: {generate_sql_time:.2f}秒")
+        print(f"SQL脚本文件大小: {file_size:.2f} MB")
+        print(f"文件位置: {os.path.abspath(sql_filepath)}")
+        print("\n使用方法:")
+        print("1. 登录MySQL命令行:")
+        print("   mysql -u root -p performance_db")
+        print("2. 执行SQL脚本:")
+        print(f"   source {os.path.abspath(sql_filepath)}")
+
+    except Exception as e:
+        logging.error(f"生成SQL脚本失败: {e}")
+    finally:
+        # 断开连接
+        processor.disconnect()
+
+
+def plan_four(processor: MySQLBatchProcessor):
+    """
+    生成本地CSV文件以便手动导入
+    :param processor: MySQLBatchProcessor实例
+    """
+    try:
+        # 生成测试数据
+        generate_data_count = 10000000
+        print(f"正在生成{generate_data_count / 10000}万条测试数据...")
+        start_time = time.time()
+        test_data = generate_test_data(generate_data_count)
+        generate_time = time.time() - start_time
+        print(f"数据生成完成，耗时: {generate_time:.2f}秒")
+
+        # 生成CSV文件
+        csv_filename = "test_data_for_manual_import.csv"
+        print(f"正在生成CSV文件: {csv_filename}")
+
+        start_time = time.time()
+        csv_filepath = save_data_to_csv(test_data, csv_filename)
+        generate_csv_time = time.time() - start_time
+        file_size = os.path.getsize(csv_filename) / (1024 * 1024)  # MB
+
+        print(f"CSV文件生成完成，耗时: {generate_csv_time:.2f}秒")
+        print(f"CSV文件大小: {file_size:.2f} MB")
+        print(f"文件位置: {os.path.abspath(csv_filepath)}")
+        print("\n手动导入方法:")
+        print("1. 打开MySQL客户端工具(如Navicat、MySQL Workbench等)")
+        print("2. 右键点击目标表 'test_users'")
+        print("3. 选择 '导入向导' 或类似选项")
+        print("4. 选择生成的CSV文件")
+        print("5. 配置导入选项:")
+        print("   - 字段分隔符: 逗号(,)")
+        print("   - 文本限定符: 双引号(\")")
+        print("   - 行分隔符: 换行符(\\n)")
+        print("   - 第一行是否包含列名: 否")
+        print("6. 开始导入")
+
+    except Exception as e:
+        logging.error(f"生成CSV文件失败: {e}")
+    finally:
+        # 断开连接
+        processor.disconnect()
+
+# 使用示例
+if __name__ == "__main__":
+    # 配置日志
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s - %(levelname)s - %(message)s')
+
+    # 创建处理器实例
+    sql_processor = MySQLBatchProcessor(
+        host='localhost',
+        port=3306,
+        user='root',
+        password='123456',
+        database='performance_db',
+        auto_optimize=True
+    )
+
+    plan_one(sql_processor)

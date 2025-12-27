@@ -585,10 +585,6 @@ class MultiTableDataGenerator:
             for column in table_schema['columns']:
                 col_name = column['name']
 
-                # 跳过自增ID列
-                if 'id' in col_name.lower() or 'AUTO_INCREMENT' in column.get('extra', ''):
-                    continue
-
                 # 检查是否为外键
                 is_foreign_key = False
                 if 'foreign_keys' in table_schema:
@@ -631,28 +627,18 @@ class MultiTableDataGenerator:
         else:
             return f"sample_{column_schema['name']}"
 
-    def insert_related_data(self, data_dict: dict, schema_config: dict, batch_size: int = 1000) -> bool:
+    def insert_related_data(self, data_dict: dict, batch_size: int = 1000) -> bool:
         """插入多表关联数据"""
         try:
             for table_name, data_list in data_dict.items():
                 if data_list:
-                    # 获取非ID列的列名
-                    columns = [col['name'] for col in schema_config[table_name]['columns']
-                               if col['name'] != 'id' and 'AUTO_INCREMENT' not in col.get('extra', '')]
-
-                    # 过滤掉每行数据中的ID值（通常是第一个元素）
-                    filtered_data_list = []
-                    for row in data_list:
-                        # 假设ID是第一个元素且为None，跳过它
-                        if row and len(row) > 0 and row[0] is None:
-                            filtered_data_list.append(row[1:])  # 跳过第一个元素
-                        else:
-                            filtered_data_list.append(row)
+                    # 获取表的列名
+                    columns = [col['name'] for col in self.get_table_schema(table_name)['columns']]
 
                     success = self.processor.batch_insert(
                         table_name=table_name,
                         columns=columns,
-                        data_list=filtered_data_list,
+                        data_list=data_list,
                         batch_size=batch_size,
                         show_progress=True
                     )
@@ -668,6 +654,18 @@ class MultiTableDataGenerator:
             logging.error(f"插入多表数据失败: {e}")
             return False
 
+    def get_table_schema(self, table_name: str) -> dict:
+        """获取表结构信息（简化版）"""
+        # 这里可以根据需要实现获取实际表结构的逻辑
+        # 为示例，返回一个基本结构
+        return {
+            'columns': [
+                {'name': 'id', 'type': 'INT', 'extra': 'AUTO_INCREMENT'},
+                {'name': 'name', 'type': 'VARCHAR(100)'},
+                # ... 其他列
+            ],
+            'foreign_keys': []
+        }
 
 
 

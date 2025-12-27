@@ -1,4 +1,5 @@
-from MySQLScript import MySQLBatchProcessor, MultiTableDataGenerator
+from MySQLScript import MySQLBatchProcessor, UniversalBatchInserter
+from Tool.AbandonedClass import MultiTableDataGenerator
 
 import random
 import uuid
@@ -120,32 +121,32 @@ def plan_multi_table_example(processor: MySQLBatchProcessor):
         schema_config = {
             'users': {
                 'columns': [
-                    {'name': 'id', 'type': 'INT', 'extra': 'AUTO_INCREMENT'},
+                    {'name': 'id', 'type': 'VARCHAR(32)'},
                     {'name': 'username', 'type': 'VARCHAR(50)'},
                     {'name': 'email', 'type': 'VARCHAR(100)'}
                 ],
-                'foreign_keys': []  # users表没有外键
+                'foreign_keys': []
             },
             'orders': {
                 'columns': [
-                    {'name': 'id', 'type': 'INT', 'extra': 'AUTO_INCREMENT'},
-                    {'name': 'user_id', 'type': 'INT'},
+                    {'name': 'id', 'type': 'VARCHAR(32)'},
+                    {'name': 'user_id', 'type': 'VARCHAR(32)'},
                     {'name': 'order_date', 'type': 'DATE'},
                     {'name': 'amount', 'type': 'DECIMAL(10,2)'}
                 ],
                 'foreign_keys': [
-                    {'column': 'user_id', 'references_table': 'users'}  # orders对users是1对n
+                    {'column': 'user_id', 'references_table': 'users'}
                 ]
             },
             'order_items': {
                 'columns': [
-                    {'name': 'id', 'type': 'INT', 'extra': 'AUTO_INCREMENT'},
-                    {'name': 'order_id', 'type': 'INT'},
+                    {'name': 'id', 'type': 'VARCHAR(32)'},
+                    {'name': 'order_id', 'type': 'VARCHAR(32)'},
                     {'name': 'product_name', 'type': 'VARCHAR(100)'},
                     {'name': 'quantity', 'type': 'INT'}
                 ],
                 'foreign_keys': [
-                    {'column': 'order_id', 'references_table': 'orders'}  # order_items对orders是1对n
+                    {'column': 'order_id', 'references_table': 'orders'}
                 ]
             }
         }
@@ -184,6 +185,76 @@ def plan_multi_table_example(processor: MySQLBatchProcessor):
     finally:
         processor.disconnect()
 
+def example_with_custom_data_generation(processor: MySQLBatchProcessor):
+    """
+    使用通用批量插入工具的示例
+    """
+
+    # 用户自定义数据生成逻辑
+    users_data = []
+    for i in range(1000):
+        user_id = str(uuid.uuid4()).replace('-', '')
+        users_data.append((user_id, f'username_{i}', f'email_{i}@example.com'))
+
+    orders_data = []
+    for i in range(3000):
+        order_id = str(uuid.uuid4()).replace('-', '')
+        # 从已生成的用户数据中选择一个ID
+        user_id = users_data[i % len(users_data)][0]  # 关联到用户
+        orders_data.append((order_id, user_id, '2023-01-01', round(random.uniform(10, 1000), 2)))
+
+    order_items_data = []
+    for i in range(9000):
+        item_id = str(uuid.uuid4()).replace('-', '')
+        # 从已生成的订单数据中选择一个ID
+        order_id = orders_data[i % len(orders_data)][0]  # 关联到订单
+        order_items_data.append(
+            (item_id, order_id, f'product_{i}', random.randint(1, 10), round(random.uniform(5, 500), 2)))
+
+    # 配置表结构
+    table_configs = [
+        {
+            'table_name': 'users',
+            'columns': ['id', 'username', 'email'],
+            'data': users_data,
+            'dependencies': []  # 没有依赖
+        },
+        {
+            'table_name': 'orders',
+            'columns': ['id', 'user_id', 'order_date', 'amount'],
+            'data': orders_data,
+            'dependencies': [
+                {
+                    'column': 'user_id',
+                    'parent_table': 'users'
+                }
+            ]
+        },
+        {
+            'table_name': 'order_items',
+            'columns': ['id', 'order_id', 'product_name', 'quantity', 'price'],
+            'data': order_items_data,
+            'dependencies': [
+                {
+                    'column': 'order_id',
+                    'parent_table': 'orders'
+                }
+            ]
+        }
+    ]
+
+    # 使用通用批量插入工具
+    inserter = UniversalBatchInserter(processor)
+    success = inserter.batch_insert_related_tables(
+        table_data_configs=table_configs,
+        batch_size=5000,
+        show_progress=True
+    )
+
+    if success:
+        print("批量插入成功")
+    else:
+        print("批量插入失败")
 
 if __name__ == '__main__':
 
@@ -196,7 +267,9 @@ if __name__ == '__main__':
         auto_optimize=True
     )
 
-    plan_multi_table_example(sql_processor)
+    example_with_custom_data_generation(sql_processor)
+
+    # plan_multi_table_example(sql_processor)
 
 
     # date = generate_test_data(100000)

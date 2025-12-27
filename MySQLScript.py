@@ -7,8 +7,6 @@ import random
 import string
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-import re
-from datetime import datetime
 
 
 class MySQLBatchProcessor:
@@ -17,8 +15,8 @@ class MySQLBatchProcessor:
     支持批量插入、更新、删除等操作
     """
 
-    def __init__(self, host: str, port: int, user: str, password: str, database: str,
-                 charset: str = 'utf8mb4', auto_optimize: bool = False):
+    def __init__(self, host: str, port: int, user: str, password: str, database: str,charset: str = 'utf8mb4',
+                 auto_optimize: bool = False):
         """
         初始化数据库连接参数
 
@@ -66,8 +64,7 @@ class MySQLBatchProcessor:
             self.connection.close()
             self.connection = None
 
-    def batch_execute(self, sql: str, data_list: List[Tuple[Any]],
-                      batch_size: int = 1000, show_progress: bool = False,
+    def batch_execute(self, sql: str, data_list: List[Tuple[Any]], batch_size: int = 1000, show_progress: bool = False,
                       use_multithreading: bool = False, max_workers: int = 4) -> bool:
         """
         批量执行SQL语句
@@ -88,8 +85,8 @@ class MySQLBatchProcessor:
         else:
             return self._batch_execute_single_threaded(sql, data_list, batch_size, show_progress)
 
-    def _batch_execute_single_threaded(self, sql: str, data_list: List[Tuple[Any]],
-                                       batch_size: int, show_progress: bool) -> bool:
+    def _batch_execute_single_threaded(self, sql: str, data_list: List[Tuple[Any]],batch_size: int,
+                                       show_progress: bool) -> bool:
         """
         单线程批量执行SQL语句
 
@@ -136,8 +133,8 @@ class MySQLBatchProcessor:
 
         return is_success
 
-    def _batch_execute_multithreaded(self, sql: str, data_list: List[Tuple[Any]],
-                                     batch_size: int, show_progress: bool, max_workers: int) -> bool:
+    def _batch_execute_multithreaded(self, sql: str, data_list: List[Tuple[Any]],batch_size: int, show_progress: bool,
+                                     max_workers: int) -> bool:
         """
         多线程批量执行SQL语句
 
@@ -210,10 +207,8 @@ class MySQLBatchProcessor:
 
         return is_success
 
-    def batch_insert(self, table_name: str, columns: List[str],
-                     data_list: List[Tuple[Any]], batch_size: int = 1000,
-                     show_progress: bool = False, use_multithreading: bool = False,
-                     max_workers: int = 4) -> bool:
+    def batch_insert(self, table_name: str, columns: List[str],data_list: List[Tuple[Any]], batch_size: int = 1000,
+                     show_progress: bool = False, use_multithreading: bool = False,max_workers: int = 4) -> bool:
         """
         批量插入数据
 
@@ -237,10 +232,9 @@ class MySQLBatchProcessor:
         return self.batch_execute(sql, data_list, batch_size, show_progress,
                                   use_multithreading, max_workers)
 
-    def batch_update(self, table_name: str, set_columns: List[str],
-                     where_column: str, data_list: List[Tuple[Any]],
-                     batch_size: int = 1000, show_progress: bool = False,
-                     use_multithreading: bool = False, max_workers: int = 4) -> bool:
+    def batch_update(self, table_name: str, set_columns: List[str], where_column: str, data_list: List[Tuple[Any]],
+                     batch_size: int = 1000, show_progress: bool = False,use_multithreading: bool = False,
+                     max_workers: int = 4) -> bool:
         """
         批量更新数据
 
@@ -382,8 +376,7 @@ class MySQLBatchProcessor:
             finally:
                 cursor.close()
 
-    def batch_insert_with_relationships(self, table_configs: List[dict],
-                                        batch_size: int = 1000,
+    def batch_insert_with_relationships(self, table_configs: List[dict], batch_size: int = 1000,
                                         show_progress: bool = False) -> bool:
         """
         批量插入具有关联关系的多表数据
@@ -508,52 +501,194 @@ class MySQLBatchProcessor:
         return []
 
 
+class UniversalBatchInserter(MySQLBatchProcessor):
+    """
+    通用的批量插入工具类
+    继承自MySQLBatchProcessor，专注于处理多表关联数据的批量插入
+    在同一事务中处理批次数据，保障数据一致性
+    """
 
-
-class MultiTableDataGenerator:
-    """多表关联数据生成器"""
-
-    def __init__(self, processor: MySQLBatchProcessor):
-        self.processor = processor
-        self.id_mappings = {}
-
-    def generate_related_data(self, schema_config: dict, record_counts: dict) -> dict:
+    def __init__(self, host: str, port: int, user: str, password: str, database: str,charset: str = 'utf8mb4',
+                 auto_optimize: bool = False):
         """
-        生成具有关联关系的多表数据
+        初始化
 
         Args:
-            schema_config: 数据库表结构配置
-            record_counts: 每个表需要生成的记录数量
+            host: 数据库主机地址
+            port: 数据库端口
+            user: 用户名
+            password: 密码
+            database: 数据库名
+            charset: 字符集
+            auto_optimize: 是否自动应用批量操作优化设置
+        """
+        super().__init__(host, port, user, password, database, charset, auto_optimize)
+
+    def batch_insert_related_tables(self, table_data_configs: List[dict], batch_size: int = 1000,
+                                    show_progress: bool = True) -> bool:
+        """
+        批量插入关联表数据（保障事务一致性）
+
+        Args:
+            table_data_configs: 表数据配置列表
+                每个配置包含:
+                - table_name: 表名
+                - columns: 列名列表
+                - data: 数据列表
+                - dependencies: 依赖关系配置 (可选)
+            batch_size: 批量大小
+            show_progress: 是否显示进度条
 
         Returns:
-            dict: 生成的数据，键为表名，值为数据列表
+            bool: 插入是否成功
         """
-        generated_data = {}
+        if not self.connect():
+            logging.error("数据库连接失败")
+            return False
 
-        # 按依赖顺序生成数据
-        ordered_tables = self._get_ordered_tables(schema_config)
+        cursor = self.connection.cursor()
+        progress_bar = None
+        try:
+            # 按依赖顺序处理表
+            ordered_configs = self._order_table_configs_by_dependency(table_data_configs)
 
-        for table_name in ordered_tables:
-            if table_name in record_counts:
-                table_data = self._generate_table_data(
-                    table_name,
-                    schema_config[table_name],
-                    record_counts[table_name],
-                    generated_data
-                )
-                generated_data[table_name] = table_data
+            # 计算总的处理记录数
+            total_records = sum(len(config['data']) for config in table_data_configs)
+            progress_bar = tqdm(total=total_records, desc="批量插入进度", disable=not show_progress,
+                                ncols=100, leave=False)
 
-        return generated_data
+            # 按批次处理所有表的数据
+            batch_count = 0
+            max_batch_size = batch_size
 
-    def _get_ordered_tables(self, schema_config: dict) -> List[str]:
-        """获取按依赖关系排序的表名列表"""
+            # 首先计算每个表的批次数量
+            all_batches = []
+            for config in ordered_configs:
+                table_name = config['table_name']
+                columns = config['columns']
+                data = config['data']
+
+                # 按批次分割数据
+                table_batches = []
+                for i in range(0, len(data), max_batch_size):
+                    batch_data = data[i:i + max_batch_size]
+                    table_batches.append({
+                        'table_name': table_name,
+                        'columns': columns,
+                        'batch_data': batch_data
+                    })
+                all_batches.extend(table_batches)
+
+            # 按批次顺序插入数据（每个批次在同一个事务中）
+            processed_records = 0
+            for batch_idx, batch_group in enumerate(self._group_batches_by_table(all_batches)):
+                # 开始事务
+                self.connection.begin()
+
+                try:
+                    batch_total_records = 0
+                    for batch_info in batch_group:
+                        table_name = batch_info['table_name']
+                        columns = batch_info['columns']
+                        batch_data = batch_info['batch_data']
+
+                        # 执行批量插入
+                        sql = self._build_insert_sql(table_name, columns)
+                        cursor.executemany(sql, batch_data)
+                        batch_total_records += len(batch_data)
+
+                        logging.debug(f"批次 {batch_idx + 1}: 插入表 {table_name} {len(batch_data)} 条记录")
+
+                    # 提交事务
+                    self.connection.commit()
+                    processed_records += batch_total_records
+                    progress_bar.update(batch_total_records)
+
+                    logging.info(f"批次 {batch_idx + 1} 插入成功，共 {batch_total_records} 条记录")
+
+                except Exception as e:
+                    # 回滚事务
+                    self.connection.rollback()
+                    logging.error(f"批次 {batch_idx + 1} 插入失败，已回滚: {e}")
+                    progress_bar.close()
+                    return False
+
+            progress_bar.close()
+            logging.info("所有表数据插入成功")
+            return True
+
+        except Exception as e:
+            logging.error(f"批量插入关联表数据失败: {e}")
+            if self.connection:
+                self.connection.rollback()
+            return False
+        finally:
+            if 'progress_bar' in locals():
+                progress_bar.close()
+            cursor.close()
+
+    def _group_batches_by_table(self, all_batches: List[dict]) -> List[List[dict]]:
+        """
+        按表分组批次，确保同一表的批次按顺序处理
+
+        Args:
+            all_batches: 所有批次数据
+
+        Returns:
+            List[List[dict]]: 按表分组的批次列表
+        """
+        # 按表名分组批次
+        batches_by_table = {}
+        for batch in all_batches:
+            table_name = batch['table_name']
+            if table_name not in batches_by_table:
+                batches_by_table[table_name] = []
+            batches_by_table[table_name].append(batch)
+
+        # 按顺序返回每个表的批次
+        result = []
+        for table_name in batches_by_table:
+            result.extend(batches_by_table[table_name])
+
+        return [[batches] for batches in result]  # 每个批次单独处理
+
+    def _build_insert_sql(self, table_name: str, columns: List[str]) -> str:
+        """
+        构建INSERT SQL语句
+
+        Args:
+            table_name: 表名
+            columns: 列名列表
+
+        Returns:
+            str: INSERT SQL语句
+        """
+        columns_str = ', '.join([f'`{col}`' for col in columns])
+        placeholders = ', '.join(['%s'] * len(columns))
+        return f"INSERT INTO `{table_name}` ({columns_str}) VALUES ({placeholders})"
+
+    def _order_table_configs_by_dependency(self, table_configs: List[dict]) -> List[dict]:
+        """
+        根据依赖关系对表配置进行排序
+
+        Args:
+            table_configs: 表配置列表
+
+        Returns:
+            List[dict]: 按依赖顺序排序的表配置列表
+        """
+        # 构建依赖图
         dependencies = {}
+        config_map = {config['table_name']: config for config in table_configs}
 
-        for table_name, table_info in schema_config.items():
+        for config in table_configs:
+            table_name = config['table_name']
             dependencies[table_name] = []
-            if 'foreign_keys' in table_info:
-                for fk in table_info['foreign_keys']:
-                    dependencies[table_name].append(fk['references_table'])
+
+            # 检查依赖关系
+            if 'dependencies' in config:
+                for dep in config['dependencies']:
+                    dependencies[table_name].append(dep['parent_table'])
 
         # 拓扑排序
         visited = set()
@@ -567,109 +702,12 @@ class MultiTableDataGenerator:
             for dep in dependencies.get(table_name, []):
                 dfs(dep)
 
-            order.append(table_name)
+            order.append(config_map[table_name])
 
         for table_name in dependencies:
             dfs(table_name)
 
         return order
-
-    def _generate_table_data(self, table_name: str, table_schema: dict,
-                             count: int, existing_data: dict) -> List[Tuple]:
-        """生成单个表的数据"""
-        data = []
-
-        for i in range(count):
-            row_data = []
-
-            for column in table_schema['columns']:
-                col_name = column['name']
-
-                # 跳过自增ID列
-                if 'id' in col_name.lower() or 'AUTO_INCREMENT' in column.get('extra', ''):
-                    continue
-
-                # 检查是否为外键
-                is_foreign_key = False
-                if 'foreign_keys' in table_schema:
-                    for fk in table_schema['foreign_keys']:
-                        if fk['column'] == col_name:
-                            # 从父表获取ID
-                            parent_table = fk['references_table']
-                            if parent_table in existing_data and existing_data[parent_table]:
-                                # 随机选择一个父表ID
-                                parent_ids = [row[0] for row in existing_data[parent_table]]  # 假设ID是第一列
-                                row_data.append(random.choice(parent_ids))
-                            else:
-                                row_data.append(None)  # 如果父表还没有数据，暂时设为NULL
-                            is_foreign_key = True
-                            break
-
-                if not is_foreign_key:
-                    # 生成普通列数据
-                    row_data.append(self._generate_column_value(column))
-
-            data.append(tuple(row_data))
-
-        return data
-
-    def _generate_column_value(self, column_schema: dict) -> Any:
-        """根据列类型生成值"""
-        col_type = column_schema['type'].upper()
-
-        if 'id' in column_schema['name'].lower() or col_type == 'INT' and 'AUTO_INCREMENT' in column_schema.get('extra', ''):
-            return None  # ID字段通常由数据库自动生成
-        elif col_type.startswith('VARCHAR') or col_type == 'TEXT':
-            length = int(re.search(r'\d+', col_type).group()) if re.search(r'\d+', col_type) else 50
-            return ''.join(random.choices(string.ascii_letters + string.digits, k=min(length, 8)))
-        elif col_type == 'INT':
-            return random.randint(1, 1000)
-        elif col_type in ['DATE', 'DATETIME', 'TIMESTAMP']:
-            return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        elif col_type == 'BOOLEAN':
-            return random.choice([True, False])
-        else:
-            return f"sample_{column_schema['name']}"
-
-    def insert_related_data(self, data_dict: dict, schema_config: dict, batch_size: int = 1000) -> bool:
-        """插入多表关联数据"""
-        try:
-            for table_name, data_list in data_dict.items():
-                if data_list:
-                    # 获取非ID列的列名
-                    columns = [col['name'] for col in schema_config[table_name]['columns']
-                               if col['name'] != 'id' and 'AUTO_INCREMENT' not in col.get('extra', '')]
-
-                    # 过滤掉每行数据中的ID值（通常是第一个元素）
-                    filtered_data_list = []
-                    for row in data_list:
-                        # 假设ID是第一个元素且为None，跳过它
-                        if row and len(row) > 0 and row[0] is None:
-                            filtered_data_list.append(row[1:])  # 跳过第一个元素
-                        else:
-                            filtered_data_list.append(row)
-
-                    success = self.processor.batch_insert(
-                        table_name=table_name,
-                        columns=columns,
-                        data_list=filtered_data_list,
-                        batch_size=batch_size,
-                        show_progress=True
-                    )
-
-                    if not success:
-                        logging.error(f"插入表 {table_name} 数据失败")
-                        return False
-
-            logging.info("所有表数据插入成功")
-            return True
-
-        except Exception as e:
-            logging.error(f"插入多表数据失败: {e}")
-            return False
-
-
-
 
 
 def generate_test_data(count: int) -> List[Tuple[Any]]:

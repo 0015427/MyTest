@@ -4,8 +4,9 @@ import time
 from tqdm import tqdm
 import random
 import string
-from MySQLScript import MySQLBatchProcessor
-
+from MySQLScript import MySQLBatchProcessor, UniversalBatchInserter
+import uuid
+from datetime import datetime
 
 
 
@@ -23,6 +24,8 @@ def generate_test_data(count: int) -> List[Tuple[Any]]:
     process_bar = tqdm(total=count, desc="生成数据进度", disable= False,
                                 ncols=100, leave=False)
     for i in range(count):
+        # 生成id
+        id = str(uuid.uuid4()).replace('-', '')
         # 生成随机用户名
         username = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
         # 生成随机年龄(18-80)
@@ -32,7 +35,10 @@ def generate_test_data(count: int) -> List[Tuple[Any]]:
         # 生成随机城市
         cities = ['北京', '上海', '广州', '深圳', '杭州', '南京', '武汉', '成都']
         city = random.choice(cities)
-        data.append((username, age, email, city))
+        # 生成时间
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        data.append((id, username, age, email, city, created_at))
         process_bar.update()
     process_bar.close()
     return data
@@ -47,13 +53,13 @@ def create_test_table(processor: MySQLBatchProcessor):
     """
     create_table_sql = """
     CREATE TABLE IF NOT EXISTS test_users (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        username VARCHAR(50) NOT NULL,
-        age INT NOT NULL,
-        email VARCHAR(100) NOT NULL,
-        city VARCHAR(50) NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
+    id VARCHAR(64) NOT NULL,  -- 增加长度
+    username VARCHAR(50) NOT NULL,
+    age INT NOT NULL,
+    email VARCHAR(100) NOT NULL,
+    city VARCHAR(50) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     """
 
     cursor = processor.connection.cursor()
@@ -373,7 +379,7 @@ def plan_four(processor: MySQLBatchProcessor):
     """
     try:
         # 生成测试数据
-        generate_data_count = 10000000
+        generate_data_count = 10000
         print(f"正在生成{generate_data_count / 10000}万条测试数据...")
         start_time = time.time()
         test_data = generate_test_data(generate_data_count)
@@ -398,17 +404,91 @@ def plan_four(processor: MySQLBatchProcessor):
         print("3. 选择 '导入向导' 或类似选项")
         print("4. 选择生成的CSV文件")
         print("5. 配置导入选项:")
-        print("   - 字段分隔符: 逗号(,)")
-        print("   - 文本限定符: 双引号(\")")
-        print("   - 行分隔符: 换行符(\\n)")
-        print("   - 第一行是否包含列名: 否")
-        print("6. 开始导入")
+        print("6. 先选这CSV文件")
+        print("7. 改变，选择EXCEL填写友好配置")
+        print("8. 字符集选语句CHARSET，一般utf8mb4")
+        print("9. 点击导入")
 
     except Exception as e:
         logging.error(f"生成CSV文件失败: {e}")
     finally:
         # 断开连接
         processor.disconnect()
+
+
+def example_with_per_table_batch_size(processor: MySQLBatchProcessor):
+    """
+    使用每个表独立批量大小的示例
+    """
+    # 生成数据（假设1对N关系：1个用户对应3个订单，1个订单对应3个商品项）
+    users_data = []
+    for i in range(1000):
+        user_id = str(uuid.uuid4()).replace('-', '')
+        users_data.append((user_id, f'username_{i}', f'email_{i}@example.com'))
+
+    orders_data = []
+    for i in range(3000):  # 3倍于用户数
+        order_id = str(uuid.uuid4()).replace('-', '')
+        user_id = users_data[i % len(users_data)][0]
+        orders_data.append((order_id, user_id, '2023-01-01', round(random.uniform(10, 1000), 2)))
+
+    order_items_data = []
+    for i in range(9000):  # 3倍于订单数
+        item_id = str(uuid.uuid4()).replace('-', '')
+        order_id = orders_data[i % len(orders_data)][0]
+        order_items_data.append(
+            (item_id, order_id, f'product_{i}', random.randint(1, 10), round(random.uniform(5, 500), 2)))
+
+    # 配置表结构，每个表有自己的批量大小
+    table_configs = [
+        {
+            'table_name': 'users',
+            'columns': ['id', 'username', 'email'],
+            'data': users_data,
+            'dependencies': [],
+            'batch_size': 500,  # 用户表较小批量
+            'relationship_multiplier': 0.5  # 可选：关系乘数
+        },
+        {
+            'table_name': 'orders',
+            'columns': ['id', 'user_id', 'order_date', 'amount'],
+            'data': orders_data,
+            'dependencies': [{'column': 'user_id', 'parent_table': 'users'}],
+            'batch_size': 1500,  # 订单表中等批量
+            'relationship_multiplier': 1.5
+        },
+        {
+            'table_name': 'order_items',
+            'columns': ['id', 'order_id', 'product_name', 'quantity', 'price'],
+            'data': order_items_data,
+            'dependencies': [{'column': 'order_id', 'parent_table': 'orders'}],
+            'batch_size': 4500,  # 商品项表大批量
+            'relationship_multiplier': 3.0
+        }
+    ]
+
+    # 使用通用批量插入工具
+    inserter = UniversalBatchInserter(**processor.config)
+
+    # 使用基础版本
+    success = inserter.batch_insert_related_tables(
+        table_data_configs=table_configs,
+        batch_size=1000,  # 这个值会被各表的batch_size覆盖
+        show_progress=True
+    )
+
+    # 或使用高级版本
+    # success = inserter.batch_insert_related_tables_advanced(
+    #     table_data_configs=table_configs,
+    #     base_batch_size=1000,
+    #     show_progress=True
+    # )
+
+    if success:
+        print("批量插入成功")
+    else:
+        print("批量插入失败")
+
 
 # 使用示例
 if __name__ == "__main__":
@@ -426,4 +506,11 @@ if __name__ == "__main__":
         auto_optimize=True
     )
 
-    plan_one(sql_processor)
+    # 单表插入方式
+    # plan_one(sql_processor)
+
+    # 多关联表插入方式（如果可以更推荐导入CSV，可以查看数据，更直观）
+    # example_with_per_table_batch_size(sql_processor)
+
+    # CSV导入
+    plan_four(sql_processor)

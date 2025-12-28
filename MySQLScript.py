@@ -637,7 +637,7 @@ class UniversalBatchInserter(MySQLBatchProcessor):
     def batch_insert_related_tables_advanced(self, table_data_configs: List[dict],base_batch_size: int = 1000,
                                              show_progress: bool = True) -> bool:
         """
-        高级批量插入关联表数据（支持基于关系的智能批次大小）
+        优化后批量插入关联表数据
 
         Args:
             table_data_configs: 表数据配置列表，每个配置可包含:

@@ -536,7 +536,8 @@ class UniversalBatchInserter(MySQLBatchProcessor):
                 - columns: 列名列表
                 - data: 数据列表
                 - dependencies: 依赖关系配置 (可选)
-            batch_size: 批量大小
+                - batch_size: 该表的批量大小 (可选，默认使用全局batch_size)
+            batch_size: 默认批量大小
             show_progress: 是否显示进度条
 
         Returns:
@@ -557,49 +558,52 @@ class UniversalBatchInserter(MySQLBatchProcessor):
             progress_bar = tqdm(total=total_records, desc="批量插入进度", disable=not show_progress,
                                 ncols=100, leave=False)
 
-            # 按批次处理所有表的数据
-            batch_count = 0
-            max_batch_size = batch_size
-
-            # 首先计算每个表的批次数量
-            all_batches = []
+            # 计算每个表的最大批次数量
+            table_batches = {}
             for config in ordered_configs:
-                table_name = config['table_name']
-                columns = config['columns']
-                data = config['data']
+                table_batch_size = config.get('batch_size', batch_size)  # 使用表特定的批量大小或默认值
+                data_count = len(config['data'])
+                table_max_batches = (data_count + table_batch_size - 1) // table_batch_size
+                table_batches[config['table_name']] = {
+                    'max_batches': table_max_batches,
+                    'batch_size': table_batch_size,
+                    'data': config['data']
+                }
 
-                # 按批次分割数据
-                table_batches = []
-                for i in range(0, len(data), max_batch_size):
-                    batch_data = data[i:i + max_batch_size]
-                    table_batches.append({
-                        'table_name': table_name,
-                        'columns': columns,
-                        'batch_data': batch_data
-                    })
-                all_batches.extend(table_batches)
+            # 计算全局最大批次数量
+            max_batches = max([info['max_batches'] for info in table_batches.values()]) if table_batches else 0
 
-            # 按批次顺序插入数据（每个批次在同一个事务中）
+            # 按批次处理所有表的数据（跨表批次）
             processed_records = 0
-            for batch_idx, batch_group in enumerate(self._group_batches_by_table(all_batches)):
+            for batch_idx in range(max_batches):
                 # 开始事务
                 self.connection.begin()
 
                 try:
                     batch_total_records = 0
-                    for batch_info in batch_group:
-                        table_name = batch_info['table_name']
-                        columns = batch_info['columns']
-                        batch_data = batch_info['batch_data']
+                    # 对每个表处理当前批次的数据
+                    for config in ordered_configs:
+                        table_name = config['table_name']
+                        columns = config['columns']
+                        table_batch_info = table_batches[table_name]
+                        table_batch_size = table_batch_info['batch_size']
+                        table_data = table_batch_info['data']
 
-                        # 执行批量插入
-                        sql = self._build_insert_sql(table_name, columns)
-                        cursor.executemany(sql, batch_data)
-                        batch_total_records += len(batch_data)
+                        # 计算当前批次的数据范围
+                        start_idx = batch_idx * table_batch_size
+                        end_idx = min((batch_idx + 1) * table_batch_size, len(table_data))
 
-                        logging.debug(f"批次 {batch_idx + 1}: 插入表 {table_name} {len(batch_data)} 条记录")
+                        if start_idx < len(table_data):  # 如果还有数据
+                            batch_data = table_data[start_idx:end_idx]
 
-                    # 提交事务
+                            # 执行批量插入
+                            sql = self._build_insert_sql(table_name, columns)
+                            cursor.executemany(sql, batch_data)
+                            batch_total_records += len(batch_data)
+
+                            logging.debug(f"批次 {batch_idx + 1}: 插入表 {table_name} {len(batch_data)} 条记录")
+
+                    # 提交事务（包含所有表的当前批次数据）
                     self.connection.commit()
                     processed_records += batch_total_records
                     progress_bar.update(batch_total_records)
@@ -610,10 +614,12 @@ class UniversalBatchInserter(MySQLBatchProcessor):
                     # 回滚事务
                     self.connection.rollback()
                     logging.error(f"批次 {batch_idx + 1} 插入失败，已回滚: {e}")
-                    progress_bar.close()
+                    if progress_bar:
+                        progress_bar.close()
                     return False
 
-            progress_bar.close()
+            if progress_bar:
+                progress_bar.close()
             logging.info("所有表数据插入成功")
             return True
 
@@ -623,34 +629,138 @@ class UniversalBatchInserter(MySQLBatchProcessor):
                 self.connection.rollback()
             return False
         finally:
-            if 'progress_bar' in locals():
+            if progress_bar:
                 progress_bar.close()
             cursor.close()
 
-    def _group_batches_by_table(self, all_batches: List[dict]) -> List[List[dict]]:
+
+    def batch_insert_related_tables_advanced(self, table_data_configs: List[dict],base_batch_size: int = 1000,
+                                             show_progress: bool = True) -> bool:
         """
-        按表分组批次，确保同一表的批次按顺序处理
+        高级批量插入关联表数据（支持基于关系的智能批次大小）
 
         Args:
-            all_batches: 所有批次数据
+            table_data_configs: 表数据配置列表，每个配置可包含:
+                - table_name: 表名
+                - columns: 列名列表
+                - data: 数据列表
+                - dependencies: 依赖关系配置
+                - batch_size: 该表的批量大小 (可选)
+                - relationship_multiplier: 关系乘数，用于自动计算批次大小 (可选)
+            base_batch_size: 基础批量大小
+            show_progress: 是否显示进度条
 
         Returns:
-            List[List[dict]]: 按表分组的批次列表
+            bool: 插入是否成功
         """
-        # 按表名分组批次
-        batches_by_table = {}
-        for batch in all_batches:
-            table_name = batch['table_name']
-            if table_name not in batches_by_table:
-                batches_by_table[table_name] = []
-            batches_by_table[table_name].append(batch)
+        if not self.connect():
+            logging.error("数据库连接失败")
+            return False
 
-        # 按顺序返回每个表的批次
-        result = []
-        for table_name in batches_by_table:
-            result.extend(batches_by_table[table_name])
+        cursor = self.connection.cursor()
+        progress_bar = None
+        try:
+            # 按依赖顺序处理表
+            ordered_configs = self._order_table_configs_by_dependency(table_data_configs)
 
-        return [[batches] for batches in result]  # 每个批次单独处理
+            # 计算总的处理记录数
+            total_records = sum(len(config['data']) for config in table_data_configs)
+            progress_bar = tqdm(total=total_records, desc="批量插入进度", disable=not show_progress,
+                                ncols=100, leave=False)
+
+            # 为每个表计算实际的批次大小
+            table_configs_with_batch = []
+            for config in ordered_configs:
+                # 优先使用配置的批次大小，否则根据关系乘数计算
+                if 'batch_size' in config:
+                    actual_batch_size = config['batch_size']
+                elif 'relationship_multiplier' in config:
+                    # 根据关系乘数计算批次大小
+                    multiplier = config['relationship_multiplier']
+                    actual_batch_size = int(base_batch_size * multiplier)
+                else:
+                    actual_batch_size = base_batch_size
+
+                table_configs_with_batch.append({
+                    **config,
+                    'actual_batch_size': actual_batch_size
+                })
+
+            # 计算每个表的最大批次数量
+            table_batches = {}
+            for config in table_configs_with_batch:
+                table_batch_size = config['actual_batch_size']
+                data_count = len(config['data'])
+                table_max_batches = (data_count + table_batch_size - 1) // table_batch_size
+                table_batches[config['table_name']] = {
+                    'max_batches': table_max_batches,
+                    'batch_size': table_batch_size,
+                    'data': config['data']
+                }
+
+            # 计算全局最大批次数量
+            max_batches = max([info['max_batches'] for info in table_batches.values()]) if table_batches else 0
+
+            # 按批次处理所有表的数据（跨表批次）
+            processed_records = 0
+            for batch_idx in range(max_batches):
+                # 开始事务
+                self.connection.begin()
+
+                try:
+                    batch_total_records = 0
+                    # 对每个表处理当前批次的数据
+                    for config in table_configs_with_batch:
+                        table_name = config['table_name']
+                        columns = config['columns']
+                        table_batch_info = table_batches[table_name]
+                        table_batch_size = table_batch_info['batch_size']
+                        table_data = table_batch_info['data']
+
+                        # 计算当前批次的数据范围
+                        start_idx = batch_idx * table_batch_size
+                        end_idx = min((batch_idx + 1) * table_batch_size, len(table_data))
+
+                        if start_idx < len(table_data):  # 如果还有数据
+                            batch_data = table_data[start_idx:end_idx]
+
+                            # 执行批量插入
+                            sql = self._build_insert_sql(table_name, columns)
+                            cursor.executemany(sql, batch_data)
+                            batch_total_records += len(batch_data)
+
+                            logging.debug(f"批次 {batch_idx + 1}: 插入表 {table_name} {len(batch_data)} 条记录")
+
+                    # 提交事务（包含所有表的当前批次数据）
+                    self.connection.commit()
+                    processed_records += batch_total_records
+                    progress_bar.update(batch_total_records)
+
+                    logging.info(f"批次 {batch_idx + 1} 插入成功，共 {batch_total_records} 条记录")
+
+                except Exception as e:
+                    # 回滚事务
+                    self.connection.rollback()
+                    logging.error(f"批次 {batch_idx + 1} 插入失败，已回滚: {e}")
+                    if progress_bar:
+                        progress_bar.close()
+                    return False
+
+            if progress_bar:
+                progress_bar.close()
+            logging.info("所有表数据插入成功")
+            return True
+
+        except Exception as e:
+            logging.error(f"批量插入关联表数据失败: {e}")
+            if self.connection:
+                self.connection.rollback()
+            return False
+        finally:
+            if progress_bar:
+                progress_bar.close()
+            cursor.close()
+
 
     def _build_insert_sql(self, table_name: str, columns: List[str]) -> str:
         """

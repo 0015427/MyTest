@@ -256,6 +256,81 @@ def example_with_custom_data_generation(processor: MySQLBatchProcessor):
     else:
         print("批量插入失败")
 
+
+def example_with_per_table_batch_size(processor: MySQLBatchProcessor):
+    """
+    使用每个表独立批量大小的示例
+    """
+    # 生成数据（假设1对N关系：1个用户对应3个订单，1个订单对应3个商品项）
+    users_data = []
+    for i in range(1000):
+        user_id = str(uuid.uuid4()).replace('-', '')
+        users_data.append((user_id, f'username_{i}', f'email_{i}@example.com'))
+
+    orders_data = []
+    for i in range(3000):  # 3倍于用户数
+        order_id = str(uuid.uuid4()).replace('-', '')
+        user_id = users_data[i % len(users_data)][0]
+        orders_data.append((order_id, user_id, '2023-01-01', round(random.uniform(10, 1000), 2)))
+
+    order_items_data = []
+    for i in range(9000):  # 3倍于订单数
+        item_id = str(uuid.uuid4()).replace('-', '')
+        order_id = orders_data[i % len(orders_data)][0]
+        order_items_data.append(
+            (item_id, order_id, f'product_{i}', random.randint(1, 10), round(random.uniform(5, 500), 2)))
+
+    # 配置表结构，每个表有自己的批量大小
+    table_configs = [
+        {
+            'table_name': 'users',
+            'columns': ['id', 'username', 'email'],
+            'data': users_data,
+            'dependencies': [],
+            'batch_size': 500,  # 用户表较小批量
+            'relationship_multiplier': 0.5  # 可选：关系乘数
+        },
+        {
+            'table_name': 'orders',
+            'columns': ['id', 'user_id', 'order_date', 'amount'],
+            'data': orders_data,
+            'dependencies': [{'column': 'user_id', 'parent_table': 'users'}],
+            'batch_size': 1500,  # 订单表中等批量
+            'relationship_multiplier': 1.5
+        },
+        {
+            'table_name': 'order_items',
+            'columns': ['id', 'order_id', 'product_name', 'quantity', 'price'],
+            'data': order_items_data,
+            'dependencies': [{'column': 'order_id', 'parent_table': 'orders'}],
+            'batch_size': 4500,  # 商品项表大批量
+            'relationship_multiplier': 3.0
+        }
+    ]
+
+    # 使用通用批量插入工具
+    inserter = UniversalBatchInserter(**processor.config)
+
+    # 使用基础版本
+    success = inserter.batch_insert_related_tables(
+        table_data_configs=table_configs,
+        batch_size=1000,  # 这个值会被各表的batch_size覆盖
+        show_progress=True
+    )
+
+    # 或使用高级版本
+    # success = inserter.batch_insert_related_tables_advanced(
+    #     table_data_configs=table_configs,
+    #     base_batch_size=1000,
+    #     show_progress=True
+    # )
+
+    if success:
+        print("批量插入成功")
+    else:
+        print("批量插入失败")
+
+
 if __name__ == '__main__':
 
     sql_processor = MySQLBatchProcessor(
